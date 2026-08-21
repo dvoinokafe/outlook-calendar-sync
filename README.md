@@ -8,8 +8,10 @@ It is designed for users who need to keep calendars from two different companies
 
 - Bidirectional synchronization between two Outlook calendar stores
 - Create, update, and delete propagation
+- Delete prompt for synced appointments while the background sync is running
 - Recurring-series support
 - Individual recurring occurrence changes and deletions
+- Mirrored copies marked with the gray `DY Sync` Outlook category
 - Local SQLite mapping database to avoid duplicate copies
 - Last-writer-wins conflict handling
 - Per-user autostart without administrator rights
@@ -46,6 +48,8 @@ STORE_B_HINT = "me@company-b.com"
 
 Use strings that uniquely identify the two Outlook mailbox/store names.
 The email address is usually the easiest value to match.
+Email-address hints also allow the script to recognize invitations sent
+between the two configured accounts and skip mirroring them.
 
 You can also tune the scan window and polling periods in `settings.py`:
 
@@ -71,7 +75,8 @@ Then test both directions:
 
 1. Create a normal appointment in Calendar A and verify it appears in Calendar B.
 2. Modify it and verify the copy changes.
-3. Delete it and verify the copy disappears.
+3. Delete it while the background sync is running and choose whether the
+   delete applies only in this account or in both accounts.
 4. Repeat from Calendar B.
 5. Create a recurring series.
 6. Modify only one occurrence and verify only that occurrence changes.
@@ -138,6 +143,18 @@ do not update Outlook and `sync.db` at the same time.
 The selected-item command rejects empty selections, multiple selections,
 non-appointment selections, and appointments outside the two configured
 calendar stores.
+
+If Outlook reports the selected appointment from an unexpected folder,
+the error message includes the selected folder/store, the configured
+Calendar A/B folders, and the settings file path being used. Already
+synced mirrored copies can still be matched by their sync marker and
+local database row when Outlook shows them from a search/result view
+instead of the calendar folder itself.
+
+Meetings sent from Calendar A's configured account to Calendar B's
+configured account, or from B to A, are skipped by both background sync
+and Sync Selected. Outlook already delivers those invitations to the
+recipient mailbox, so mirroring them would create duplicates.
 
 `--status` reports whether the script is `starting`, `waiting`, or
 `syncing`. If it is waiting for Outlook/calendars, the status output
@@ -208,14 +225,16 @@ already running.
 To use them in Classic Outlook:
 
 1. Open `OutlookSyncControls.bas` and edit `SYNC_SCRIPT` to the full path
-   of your `outlook_calendar_sync.py`.
+   of your `outlook_calendar_sync.py`. The published template leaves this
+   blank deliberately so local machine paths are not shared.
 2. If your real settings file is not next to the script, edit
    `SETTINGS_FILE` to its full path. Leave it blank to use the adjacent
    `settings.py`.
-3. Confirm `PYTHON_COMMAND` points to your real `python.exe`. The
-   template uses the normal per-user Python 3.12 path and avoids the
-   Windows `py` launcher because Outlook can fail to launch `py` from a
-   hidden macro command.
+3. Confirm `PYTHON_COMMAND`. Leave it blank to use `py -3`, set it to a
+   specific launcher command such as `py -3.12`, or set it to the full
+   path of the `python.exe` that has `pywin32` installed. If you need the
+   full path, run `py -0p` in PowerShell and copy the matching Python
+   path.
 4. In Classic Outlook, open the VBA editor with `Alt+F11`.
 5. Import `OutlookSyncControls.bas`.
 6. Add the macros to the Quick Access Toolbar or a custom Ribbon group.
@@ -225,6 +244,17 @@ response. Start reports `Already running` when applicable. Stop reports
 which tracked sync PID(s) were stopped. Restart refuses to start a new
 sync if nothing was already running. Sync Selected copies or updates
 only the currently selected/open appointment.
+
+The VBA macro trims configured paths and strips accidental wrapping
+quotes, so either `C:\Path\To\outlook_calendar_sync.py` or
+`"C:\Path\To\outlook_calendar_sync.py"` can be pasted safely. Embedded
+quotes or line breaks are rejected with a clear Outlook message. For
+`PYTHON_COMMAND`, use either a simple launcher command like `py -3.12`
+or a full `python.exe` path; do not combine a quoted executable path with
+extra Python arguments.
+Button commands run through a hidden temporary `.cmd` wrapper so paths
+with spaces in `SYNC_SCRIPT`, `SETTINGS_FILE`, or `PYTHON_COMMAND` are
+handled correctly.
 
 If your company disables Outlook VBA macros, use the command-line
 controls above or ask IT whether signed Outlook macros are allowed.
@@ -244,6 +274,10 @@ The synchronizer copies:
 - Importance
 - Reminder settings
 
+Mirrored copies are also marked with the gray Outlook category `DY Sync`.
+That marker is reserved for the synchronizer, ignored by the comparison
+hash, and not copied back to the original appointment.
+
 It intentionally does **not** copy:
 
 - Organizer
@@ -251,7 +285,27 @@ It intentionally does **not** copy:
 - Meeting-response state
 - Online-meeting metadata
 
+Because organizer and attendee semantics are not copied, direct
+invitations between the two configured accounts are left to Outlook's
+normal invitation delivery instead of being mirrored by this script.
+
 This avoids having the mirrored appointment act as a second meeting organizer and prevents duplicate invitations or updates.
+
+## Delete choices
+
+When the background synchronizer is running, it listens for deletes from
+the two configured calendar folders. If you delete a synced appointment,
+Outlook Calendar Sync asks whether to delete it from both configured
+accounts, delete it only from the current account, or cancel the delete.
+
+Choosing both accounts lets Outlook delete the selected item, then the
+next sync pass deletes the paired copy. Choosing only this account lets
+Outlook delete the selected item, then the next sync pass removes only
+the local pairing row and keeps the other account's appointment.
+
+This prompt is available only while the background sync process is
+running. If the sync process is stopped, Outlook can still delete the
+item, and the next reconciliation follows the normal missing-item rule.
 
 ## Recurring meetings
 
@@ -337,13 +391,22 @@ Install pywin32 for the same Python interpreter used to run the script:
 py -m pip install --user -r requirements.txt
 ```
 
+If `PYTHON_COMMAND` is set to a specific launcher version, use the same
+version for installation, for example:
+
+```powershell
+py -3.12 -m pip install --user -r requirements.txt
+```
+
 Then verify the import setup:
 
 ```powershell
 py -c "import pythoncom, win32com.client"
 ```
 
-If this still fails, check that `py outlook_calendar_sync.py` and `py -m pip ...` are using the same Python installation or virtual environment.
+If this still fails, check that the button's `PYTHON_COMMAND` and the
+`pip install` command are using the same Python installation or virtual
+environment.
 
 ### Duplicate appointments
 

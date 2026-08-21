@@ -41,6 +41,14 @@ Recurring meetings are synchronized occurrence-by-occurrence inside a
 rolling window. This avoids having to reproduce recurrence exception
 internals across two unrelated company mailboxes.
 
+When one configured account invites the other configured account, the
+meeting is not mirrored. Outlook delivers that invitation naturally to
+the other mailbox, so copying it would create a duplicate.
+
+Mirrored copies are marked with a gray Outlook category named "DY Sync".
+That marker is ignored by the comparison hash and is not copied back to
+the original appointment.
+
 IMPORTANT
 ---------
 This script requires CLASSIC OUTLOOK.
@@ -260,6 +268,7 @@ KNOWN LIMITATIONS
 """
 
 import argparse
+import ctypes
 import hashlib
 import importlib
 import importlib.util
@@ -276,8 +285,11 @@ from pathlib import Path
 # ---------- CONSTANTS ----------
 
 OL_FOLDER_CALENDAR = 9
+OL_FOLDER_DELETED_ITEMS = 3
 OL_APPOINTMENT_ITEM = 1
 OL_RECURRENCE_STATE_NOT_RECURRING = 0
+OL_CATEGORY_COLOR_GRAY = 13
+OL_CATEGORY_SHORTCUT_NONE = 0
 
 BASE_DIR = Path(os.environ.get("LOCALAPPDATA", ".")) / "OutlookCalendarSync"
 DB_PATH = BASE_DIR / "sync.db"
@@ -301,7 +313,21 @@ STOP_WAIT_SECONDS = 5
 
 SYNC_PROP = "OutlookCalendarSyncKey"
 SYNC_NS = "http://schemas.microsoft.com/mapi/string/{00020329-0000-0000-C000-000000000046}/"
+SYNC_CATEGORY_NAME = "DY Sync"
+PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 LOGGING_READY = False
+
+DELETE_SCOPE_BOTH = "both"
+DELETE_SCOPE_LOCAL = "local"
+DELETE_SCOPE_CANCEL = "cancel"
+
+MESSAGE_BOX_YES = 6
+MESSAGE_BOX_NO = 7
+MESSAGE_BOX_CANCEL = 2
+MESSAGE_BOX_YES_NO_CANCEL = 0x00000003
+MESSAGE_BOX_ICON_QUESTION = 0x00000020
+MESSAGE_BOX_TASK_MODAL = 0x00002000
+MESSAGE_BOX_SET_FOREGROUND = 0x00010000
 
 REQUIRED_SETTINGS = (
     "STORE_A_HINT",
@@ -870,7 +896,13 @@ def request_stop(stop_path=None):
     return path
 
 
-def wait_for_stop_or_timeout(seconds, stop_path=None, sleep_func=None, monotonic_func=None):
+def wait_for_stop_or_timeout(
+    seconds,
+    stop_path=None,
+    sleep_func=None,
+    monotonic_func=None,
+    tick_func=None,
+):
     sleep_func = sleep_func or time.sleep
     monotonic_func = monotonic_func or time.monotonic
     deadline = monotonic_func() + seconds
@@ -881,6 +913,8 @@ def wait_for_stop_or_timeout(seconds, stop_path=None, sleep_func=None, monotonic
         remaining = deadline - monotonic_func()
         if remaining <= 0:
             return False
+        if tick_func is not None:
+            tick_func()
         sleep_func(min(CONTROL_SLEEP_SECONDS, remaining))
 
 
@@ -1192,6 +1226,58 @@ def calendar_folder_path(calendar):
     return safe_get(calendar, "FolderPath", "") or ""
 
 
+def folder_identity(folder):
+    if folder is None:
+        return None
+    return (
+        str(safe_get(folder, "EntryID", "") or ""),
+        str(safe_get(folder, "StoreID", "") or ""),
+        calendar_folder_path(folder).casefold(),
+    )
+
+
+def same_outlook_folder(left, right):
+    left_identity = folder_identity(left)
+    right_identity = folder_identity(right)
+    if left_identity is None or right_identity is None:
+        return False
+
+    left_entry, left_store, left_path = left_identity
+    right_entry, right_store, right_path = right_identity
+    if left_entry and right_entry:
+        if left_store or right_store:
+            return left_entry == right_entry and left_store == right_store
+        return left_entry == right_entry
+    return bool(left_path and left_path == right_path)
+
+
+def deleted_items_folder_for(folder):
+    store = safe_get(folder, "Store")
+    if store is not None:
+        try:
+            return store.GetDefaultFolder(OL_FOLDER_DELETED_ITEMS)
+        except Exception:
+            logging.debug("Could not resolve Deleted Items through folder store", exc_info=True)
+    return None
+
+
+def is_deleted_items_destination(source_folder, move_to):
+    if move_to is None:
+        return True
+
+    deleted_folder = deleted_items_folder_for(source_folder)
+    if deleted_folder is not None and same_outlook_folder(move_to, deleted_folder):
+        return True
+
+    folder_name = str(safe_get(move_to, "Name", "") or "").casefold()
+    folder_path = calendar_folder_path(move_to).casefold()
+    return folder_name == "deleted items" or folder_path.endswith("\\deleted items")
+
+
+def windows_message_box(message, title, flags):
+    return ctypes.windll.user32.MessageBoxW(0, message, title, flags)
+
+
 def call_outlook_member(obj, name, default=None):
     if obj is None:
         return default
@@ -1204,8 +1290,168 @@ def call_outlook_member(obj, name, default=None):
         return default
 
 
+def normalized_identity(value):
+    try:
+        text = str(value or "").strip().lower()
+    except Exception:
+        return ""
+    if text.startswith("mailto:"):
+        text = text[7:].strip()
+    return text
+
+
+def identity_matches(value, expected):
+    text = normalized_identity(value)
+    needle = normalized_identity(expected)
+    return bool(text and needle and (text == needle or needle in text))
+
+
+def append_identity_value(values, value):
+    text = normalized_identity(value)
+    if text:
+        values.append(text)
+
+
+def append_property_accessor_smtp(values, obj):
+    accessor = safe_get(obj, "PropertyAccessor")
+    if accessor is None:
+        return
+    try:
+        append_identity_value(values, accessor.GetProperty(PR_SMTP_ADDRESS))
+    except Exception:
+        return
+
+
+def append_outlook_identity(values, obj):
+    if obj is None:
+        return
+    for prop in ("PrimarySmtpAddress", "SmtpAddress", "Address", "Name", "DisplayName"):
+        append_identity_value(values, safe_get(obj, prop))
+    append_property_accessor_smtp(values, obj)
+
+
+def organizer_identity_values(item):
+    values = []
+    for prop in (
+        "Organizer",
+        "SenderEmailAddress",
+        "SenderName",
+        "SentOnBehalfOfName",
+    ):
+        append_identity_value(values, safe_get(item, prop))
+
+    append_outlook_identity(values, safe_get(item, "SendUsingAccount"))
+    return values
+
+
+def recipient_identity_values(item):
+    values = []
+    for prop in ("RequiredAttendees", "OptionalAttendees", "Resources"):
+        append_identity_value(values, safe_get(item, prop))
+
+    recipients = safe_get(item, "Recipients")
+    try:
+        count = int(safe_get(recipients, "Count", 0) or 0)
+    except (TypeError, ValueError):
+        count = 0
+
+    for index in range(1, count + 1):
+        try:
+            recipient = recipients.Item(index)
+        except Exception:
+            continue
+        append_outlook_identity(values, recipient)
+        address_entry = safe_get(recipient, "AddressEntry")
+        append_outlook_identity(values, address_entry)
+        append_outlook_identity(values, call_outlook_member(address_entry, "GetExchangeUser"))
+        append_outlook_identity(
+            values,
+            call_outlook_member(address_entry, "GetExchangeDistributionList"),
+        )
+
+    return values
+
+
+def identity_values_include(values, expected):
+    return any(identity_matches(value, expected) for value in values)
+
+
+def is_cross_account_invite(item, settings, source_side=None):
+    if item is None or not is_appointment_item(item):
+        return False
+
+    account_a = safe_get(settings, "STORE_A_HINT", "")
+    account_b = safe_get(settings, "STORE_B_HINT", "")
+    if not account_a or not account_b:
+        return False
+
+    organizers = organizer_identity_values(item)
+    recipients = recipient_identity_values(item)
+
+    a_is_organizer = identity_values_include(organizers, account_a)
+    b_is_organizer = identity_values_include(organizers, account_b)
+    a_is_recipient = identity_values_include(recipients, account_a)
+    b_is_recipient = identity_values_include(recipients, account_b)
+
+    side = normalized_identity(source_side)
+    if side == "a":
+        return b_is_recipient
+    if side == "b":
+        return a_is_recipient
+
+    return (a_is_organizer and b_is_recipient) or (
+        b_is_organizer and a_is_recipient
+    )
+
+
 def is_appointment_item(item):
     return safe_get(item, "Class") == 26
+
+
+def split_categories(value):
+    try:
+        raw = str(value or "")
+    except Exception:
+        raw = ""
+    return [name.strip() for name in raw.split(",") if name.strip()]
+
+
+def category_names_without_sync_marker(value):
+    marker = SYNC_CATEGORY_NAME.casefold()
+    return [name for name in split_categories(value) if name.casefold() != marker]
+
+
+def categories_without_sync_marker(value):
+    return ", ".join(category_names_without_sync_marker(value))
+
+
+def categories_with_sync_marker(value):
+    names = category_names_without_sync_marker(value)
+    names.append(SYNC_CATEGORY_NAME)
+    return ", ".join(names)
+
+
+def ensure_sync_category(namespace):
+    categories = safe_get(namespace, "Categories")
+    if categories is None:
+        return False
+
+    try:
+        categories.Item(SYNC_CATEGORY_NAME)
+        return False
+    except Exception:
+        pass
+
+    try:
+        categories.Add(
+            SYNC_CATEGORY_NAME,
+            OL_CATEGORY_COLOR_GRAY,
+            OL_CATEGORY_SHORTCUT_NONE,
+        )
+        return True
+    except Exception:
+        logging.exception("Could not create Outlook category %s", SYNC_CATEGORY_NAME)
+        return False
 
 
 def selected_appointment_from_outlook(outlook_app):
@@ -1246,7 +1492,7 @@ def normalized_body(item):
 
 def normalized_categories(item):
     c = safe_get(item, "Categories", "")
-    return c or ""
+    return categories_without_sync_marker(c)
 
 
 def payload_from_item(item):
@@ -1310,6 +1556,22 @@ def property_accessor_set(item, prop_name, value):
     item.PropertyAccessor.SetProperty(schema, value)
 
 
+def is_synced_copy_item(item):
+    return bool(property_accessor_get(item, SYNC_PROP))
+
+
+def ensure_synced_item_category(item):
+    if not is_synced_copy_item(item):
+        return False
+    current = safe_get(item, "Categories", "") or ""
+    updated = categories_with_sync_marker(current)
+    if updated == current:
+        return False
+    item.Categories = updated
+    item.Save()
+    return True
+
+
 def get_global_identity(item):
     for prop in ("GlobalAppointmentID", "EntryID"):
         val = safe_get(item, prop)
@@ -1361,6 +1623,16 @@ class Store:
                 b_sig TEXT,
                 a_modified TEXT,
                 b_modified TEXT
+            )
+            """
+        )
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS delete_choices (
+                logical_key TEXT PRIMARY KEY,
+                side TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                decided_at TEXT NOT NULL
             )
             """
         )
@@ -1422,21 +1694,73 @@ class Store:
 
     def delete(self, logical_key):
         self.db.execute("DELETE FROM pairs WHERE logical_key=?", (logical_key,))
+        self.db.execute("DELETE FROM delete_choices WHERE logical_key=?", (logical_key,))
         self.db.commit()
+
+    def record_local_delete(self, logical_key, side):
+        self.db.execute(
+            """
+            INSERT INTO delete_choices(logical_key, side, scope, decided_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(logical_key) DO UPDATE SET
+                side=excluded.side,
+                scope=excluded.scope,
+                decided_at=excluded.decided_at
+            """,
+            (
+                logical_key,
+                side,
+                DELETE_SCOPE_LOCAL,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        self.db.commit()
+
+    def delete_choice(self, logical_key):
+        row = self.db.execute(
+            """
+            SELECT side, scope
+            FROM delete_choices
+            WHERE logical_key=?
+            """,
+            (logical_key,),
+        ).fetchone()
+        if not row:
+            return None
+        side, scope = row
+        return {"side": side, "scope": scope}
+
+
+class OutlookFolderDeleteEvents:
+    sync = None
+    side = None
+
+    def OnBeforeItemMove(self, Item, MoveTo, Cancel):
+        if self.sync is None or self.side is None:
+            return Cancel
+        return self.sync.handle_before_item_move(self.side, Item, MoveTo)
 
 
 class OutlookSync:
-    def __init__(self, settings=None, com_modules=None):
+    def __init__(self, settings=None, com_modules=None, settings_path=None):
         if settings is None:
             settings = load_settings()
         if com_modules is None:
             com_modules = load_outlook_com_modules()
 
         self.settings = settings
+        self.settings_path = Path(settings_path or SETTINGS_PATH)
         pythoncom_module, win32com_client = com_modules
+        self.pythoncom = pythoncom_module
+        self.win32com_client = win32com_client
+        self.suppress_delete_prompt_depth = 0
+        self.delete_event_handlers = []
+        self.delete_event_handlers_attached = False
+        self.message_box_func = windows_message_box
         pythoncom_module.CoInitialize()
         self.outlook = win32com_client.Dispatch("Outlook.Application")
         self.ns = self.outlook.GetNamespace("MAPI")
+        ensure_sync_category(self.ns)
         self.store = Store()
 
         self.calendar_a = self.find_calendar(self.settings.STORE_A_HINT)
@@ -1447,6 +1771,124 @@ class OutlookSync:
             self.calendar_a.FolderPath,
             self.calendar_b.FolderPath,
         )
+
+    def calendar_for_side(self, side):
+        return self.calendar_a if side == "a" else self.calendar_b
+
+    def account_label(self, side):
+        if side == "a":
+            return "Calendar A"
+        return "Calendar B"
+
+    def attach_delete_prompt_handlers(self):
+        if self.delete_event_handlers_attached:
+            return
+
+        for side, calendar in (("a", self.calendar_a), ("b", self.calendar_b)):
+            try:
+                handler = self.win32com_client.WithEvents(calendar, OutlookFolderDeleteEvents)
+                handler.sync = self
+                handler.side = side
+                self.delete_event_handlers.append(handler)
+                logging.info("Delete prompt handler attached for %s", self.account_label(side))
+            except Exception:
+                logging.exception("Could not attach delete prompt handler for %s", self.account_label(side))
+
+        self.delete_event_handlers_attached = True
+
+    def pump_com_messages(self):
+        pump = safe_get(self.pythoncom, "PumpWaitingMessages")
+        if pump is None:
+            return
+        try:
+            pump()
+        except Exception:
+            logging.debug("Could not pump COM messages", exc_info=True)
+
+    def is_delete_destination(self, side, move_to):
+        return is_deleted_items_destination(self.calendar_for_side(side), move_to)
+
+    def delete_choice_for(self, logical_key):
+        delete_choice = safe_get(self.store, "delete_choice")
+        if delete_choice is None:
+            return None
+        try:
+            return delete_choice(logical_key)
+        except Exception:
+            logging.exception("Could not read delete choice for %s", logical_key)
+            return None
+
+    def is_local_only_delete_choice(self, logical_key, side):
+        choice = self.delete_choice_for(logical_key)
+        if not choice:
+            return False
+        return choice.get("side") == side and choice.get("scope") == DELETE_SCOPE_LOCAL
+
+    def handle_before_item_move(self, side, item, move_to):
+        if self.suppress_delete_prompt_depth > 0:
+            return False
+
+        try:
+            if not is_appointment_item(item):
+                return False
+
+            if not self.is_delete_destination(side, move_to):
+                return False
+
+            logical_key = self.item_logical_key(item)
+            if not self.row_for_key(logical_key):
+                return False
+
+            scope = self.prompt_delete_scope(item, side)
+            if scope == DELETE_SCOPE_CANCEL:
+                logging.info("User cancelled synced appointment delete: %s", logical_key)
+                return True
+
+            if scope == DELETE_SCOPE_LOCAL:
+                self.store.record_local_delete(logical_key, side)
+                logging.info(
+                    "User chose local-only delete for %s from %s",
+                    logical_key,
+                    self.account_label(side),
+                )
+                return False
+
+            logging.info(
+                "User chose both-account delete for %s from %s",
+                logical_key,
+                self.account_label(side),
+            )
+            return False
+        except Exception:
+            logging.exception("Delete prompt failed; allowing Outlook delete to continue")
+            return False
+
+    def prompt_delete_scope(self, item, side):
+        subject = str(safe_get(item, "Subject", "") or "(no subject)")
+        message = (
+            "Delete synced appointment?\n\n"
+            f"{subject}\n\n"
+            f"You are deleting it from {self.account_label(side)}.\n\n"
+            "Yes = delete from both configured accounts.\n"
+            "No = delete only from this account.\n"
+            "Cancel = keep the appointment."
+        )
+        flags = (
+            MESSAGE_BOX_YES_NO_CANCEL
+            | MESSAGE_BOX_ICON_QUESTION
+            | MESSAGE_BOX_TASK_MODAL
+            | MESSAGE_BOX_SET_FOREGROUND
+        )
+        result = self.message_box_func(
+            message,
+            "Outlook Calendar Sync",
+            flags,
+        )
+        if result == MESSAGE_BOX_NO:
+            return DELETE_SCOPE_LOCAL
+        if result == MESSAGE_BOX_CANCEL:
+            return DELETE_SCOPE_CANCEL
+        return DELETE_SCOPE_BOTH
 
     def find_calendar(self, hint):
         hint_lower = hint.lower()
@@ -1520,12 +1962,12 @@ class OutlookSync:
 
     def copy_into_calendar(self, source, target_calendar, logical_key):
         target = target_calendar.Items.Add(OL_APPOINTMENT_ITEM)
-        self.apply_payload(source, target)
+        self.apply_payload(source, target, mark_synced=True)
         property_accessor_set(target, SYNC_PROP, logical_key)
         target.Save()
         return target
 
-    def apply_payload(self, source, target):
+    def apply_payload(self, source, target, mark_synced=False):
         p = payload_from_item(source)
 
         target.Subject = p["Subject"]
@@ -1534,7 +1976,10 @@ class OutlookSync:
         target.End = source.End
         target.AllDayEvent = p["AllDayEvent"]
         target.Location = p["Location"]
-        target.Categories = p["Categories"]
+        if mark_synced:
+            target.Categories = categories_with_sync_marker(p["Categories"])
+        else:
+            target.Categories = p["Categories"]
         target.Sensitivity = p["Sensitivity"]
         target.BusyStatus = p["BusyStatus"]
         target.Importance = p["Importance"]
@@ -1553,10 +1998,22 @@ class OutlookSync:
     def delete_item(self, item):
         if item is None:
             return
+        self.suppress_delete_prompt_depth = safe_get(self, "suppress_delete_prompt_depth", 0) + 1
         try:
             item.Delete()
         except Exception:
             logging.exception("Delete failed")
+        finally:
+            self.suppress_delete_prompt_depth = max(
+                safe_get(self, "suppress_delete_prompt_depth", 1) - 1,
+                0,
+            )
+
+    def is_synced_copy(self, item):
+        return is_synced_copy_item(item)
+
+    def ensure_synced_category(self, item):
+        return ensure_synced_item_category(item)
 
     def selected_item(self):
         return selected_appointment_from_outlook(self.outlook)
@@ -1577,6 +2034,40 @@ class OutlookSync:
         if not folder_path and store_id and store_id == safe_get(self.calendar_b, "StoreID"):
             return "b"
         return None
+
+    def selected_pair_side_from_marker(self, item):
+        marker = property_accessor_get(item, SYNC_PROP)
+        if not marker:
+            return None
+
+        row = self.row_for_key(str(marker))
+        if row is None:
+            return None
+
+        entry_id = safe_get(item, "EntryID")
+        if entry_id and entry_id == row[1]:
+            return "a"
+        if entry_id and entry_id == row[3]:
+            return "b"
+        return None
+
+    def selected_item_rejection_message(self, item):
+        parent = safe_get(item, "Parent")
+        selected_folder = calendar_folder_path(parent) or "(unknown)"
+        selected_store = safe_get(parent, "StoreID", "(unknown)") or "(unknown)"
+        settings_path = safe_get(self, "settings_path", "")
+
+        return (
+            "The selected appointment is not in one of the configured calendars.\n\n"
+            f"Selected subject: {safe_get(item, 'Subject', '') or '(no subject)'}\n"
+            f"Selected folder: {selected_folder}\n"
+            f"Selected store: {selected_store}\n"
+            f"Calendar A: {calendar_folder_path(self.calendar_a) or '(unknown)'} "
+            f"| store: {safe_get(self.calendar_a, 'StoreID', '(unknown)') or '(unknown)'}\n"
+            f"Calendar B: {calendar_folder_path(self.calendar_b) or '(unknown)'} "
+            f"| store: {safe_get(self.calendar_b, 'StoreID', '(unknown)') or '(unknown)'}\n"
+            f"Settings: {settings_path or '(default)'}"
+        )
 
     def row_for_key(self, logical_key):
         for row in self.store.rows():
@@ -1622,9 +2113,16 @@ class OutlookSync:
 
         source_side = self.item_calendar_side(item)
         if source_side is None:
-            raise SelectedItemSyncError(
-                "The selected appointment is not in one of the configured calendars."
-            )
+            source_side = self.selected_pair_side_from_marker(item)
+        if source_side is None:
+            raise SelectedItemSyncError(self.selected_item_rejection_message(item))
+        if is_cross_account_invite(
+            item,
+            safe_get(self, "settings"),
+            source_side=source_side,
+        ):
+            subject = safe_get(item, "Subject", "") or "(no subject)"
+            return f"Skipped cross-account invite: {subject}"
 
         logical_key = self.item_logical_key(item)
         row = self.row_for_key(logical_key)
@@ -1637,7 +2135,11 @@ class OutlookSync:
             target = self.copy_into_calendar(item, target_calendar, logical_key)
             action = "Created"
         else:
-            self.apply_payload(item, target)
+            self.apply_payload(
+                item,
+                target,
+                mark_synced=self.is_synced_copy(target),
+            )
             target.Save()
             action = "Updated"
 
@@ -1645,6 +2147,7 @@ class OutlookSync:
         return f"{action} copy in {target_label}: {safe_get(item, 'Subject', '') or '(no subject)'}"
 
     def reconcile(self):
+        settings = safe_get(self, "settings")
         a_view = self.expanded_items(self.calendar_a)
         b_view = self.expanded_items(self.calendar_b)
         rows = {r[0]: r for r in self.store.rows()}
@@ -1667,6 +2170,14 @@ class OutlookSync:
             ae = a_view.get(key)
             be = b_view.get(key)
 
+            if is_cross_account_invite(ae, settings, source_side="a") or is_cross_account_invite(
+                be,
+                settings,
+                source_side="b",
+            ):
+                logging.info("Skipping cross-account invite pair: %s", key)
+                continue
+
             # expanded_items() indexes mirrored copies by the source logical
             # key stored in their custom MAPI property. If a key is absent,
             # that side's item/occurrence has genuinely disappeared from the
@@ -1678,6 +2189,11 @@ class OutlookSync:
                 continue
 
             if ae is None:
+                if self.is_local_only_delete_choice(key, "a"):
+                    logging.info("A deleted %s locally; keeping B twin", key)
+                    self.store.delete(key)
+                    deleted_keys.add(key)
+                    continue
                 logging.info("A deleted %s; deleting B twin", key)
                 self.delete_item(be)
                 self.store.delete(key)
@@ -1685,11 +2201,19 @@ class OutlookSync:
                 continue
 
             if be is None:
+                if self.is_local_only_delete_choice(key, "b"):
+                    logging.info("B deleted %s locally; keeping A twin", key)
+                    self.store.delete(key)
+                    deleted_keys.add(key)
+                    continue
                 logging.info("B deleted %s; deleting A twin", key)
                 self.delete_item(ae)
                 self.store.delete(key)
                 deleted_keys.add(key)
                 continue
+
+            ensure_synced_item_category(ae)
+            ensure_synced_item_category(be)
 
             a_changed, a_sig, a_mod = change_snapshot(ae, old_a_sig, old_a_mod)
             b_changed, b_sig, b_mod = change_snapshot(be, old_b_sig, old_b_mod)
@@ -1711,23 +2235,23 @@ class OutlookSync:
 
             if a_changed and not b_changed:
                 logging.info("Updating B from A: %s", key)
-                self.apply_payload(ae, be)
+                self.apply_payload(ae, be, mark_synced=self.is_synced_copy(be))
                 be.Save()
                 b_sig = a_sig
             elif b_changed and not a_changed:
                 logging.info("Updating A from B: %s", key)
-                self.apply_payload(be, ae)
+                self.apply_payload(be, ae, mark_synced=self.is_synced_copy(ae))
                 ae.Save()
                 a_sig = b_sig
             else:
                 if a_mod >= b_mod:
                     logging.warning("Conflict; A wins: %s", key)
-                    self.apply_payload(ae, be)
+                    self.apply_payload(ae, be, mark_synced=self.is_synced_copy(be))
                     be.Save()
                     b_sig = a_sig
                 else:
                     logging.warning("Conflict; B wins: %s", key)
-                    self.apply_payload(be, ae)
+                    self.apply_payload(be, ae, mark_synced=self.is_synced_copy(ae))
                     ae.Save()
                     a_sig = b_sig
 
@@ -1753,6 +2277,9 @@ class OutlookSync:
             if key in rows:
                 continue
             if property_accessor_get(ae, SYNC_PROP):
+                continue
+            if is_cross_account_invite(ae, settings, source_side="a"):
+                logging.info("Skipping cross-account invite from A: %s", key)
                 continue
 
             logging.info("Creating B twin: %s", key)
@@ -1785,6 +2312,9 @@ class OutlookSync:
                 continue
             if property_accessor_get(be, SYNC_PROP):
                 continue
+            if is_cross_account_invite(be, settings, source_side="b"):
+                logging.info("Skipping cross-account invite from B: %s", key)
+                continue
 
             logging.info("Creating A twin: %s", key)
             ae = self.copy_into_calendar(be, self.calendar_a, key)
@@ -1803,9 +2333,15 @@ class OutlookSync:
 
     def run(self):
         logging.info("OutlookCalendarSync started")
+        delete_handlers_attached = False
         while True:
             if stop_requested():
                 break
+            if not delete_handlers_attached:
+                attach_delete_prompt_handlers = safe_get(self, "attach_delete_prompt_handlers")
+                if attach_delete_prompt_handlers is not None:
+                    attach_delete_prompt_handlers()
+                delete_handlers_attached = True
             try:
                 with acquire_control_lock(
                     lock_path=SYNC_LOCK_PATH,
@@ -1826,7 +2362,11 @@ class OutlookSync:
                     file=sys.stderr,
                     flush=True,
                 )
-            if wait_for_stop_or_timeout(self.settings.POLL_SECONDS):
+            pump_com_messages = safe_get(self, "pump_com_messages")
+            if wait_for_stop_or_timeout(
+                self.settings.POLL_SECONDS,
+                tick_func=pump_com_messages,
+            ):
                 break
         logging.info("OutlookCalendarSync stopped")
         clear_stop_request()
@@ -1877,7 +2417,12 @@ def wait_for_outlook_ready(
             raise KeyboardInterrupt
 
         try:
-            return sync_factory(settings=settings, com_modules=com_modules)
+            sync = sync_factory(settings=settings, com_modules=com_modules)
+            try:
+                sync.settings_path = Path(settings_path or SETTINGS_PATH)
+            except Exception:
+                pass
+            return sync
         except Exception as exc:
             now = monotonic_func()
             if status_path is not None:
@@ -1938,7 +2483,11 @@ def sync_selected_item_once(settings_path=None):
     settings = load_settings(settings_path)
     com_modules = load_outlook_com_modules()
     setup_logging()
-    sync = OutlookSync(settings=settings, com_modules=com_modules)
+    sync = OutlookSync(
+        settings=settings,
+        com_modules=com_modules,
+        settings_path=settings_path,
+    )
     selected = sync.selected_item()
 
     try:

@@ -20,8 +20,9 @@ class CountingBodyItem:
 
 
 class FakeStore:
-    def __init__(self, rows):
+    def __init__(self, rows, delete_choices=None):
         self._rows = list(rows)
+        self.delete_choices = dict(delete_choices or {})
         self.upserts = []
         self.deletes = []
 
@@ -34,6 +35,10 @@ class FakeStore:
     def delete(self, key):
         self.deletes.append(key)
         self._rows = [row for row in self._rows if row[0] != key]
+        self.delete_choices.pop(key, None)
+
+    def delete_choice(self, key):
+        return self.delete_choices.get(key)
 
 
 class FakeCalendar:
@@ -100,10 +105,10 @@ class FakeOutlookCalendar:
 
 
 class FakeSync:
-    def __init__(self, a_view, b_view, rows):
+    def __init__(self, a_view, b_view, rows, delete_choices=None):
         self.calendar_a = FakeCalendar("a")
         self.calendar_b = FakeCalendar("b")
-        self.store = FakeStore(rows)
+        self.store = FakeStore(rows, delete_choices=delete_choices)
         self.views = {"a": a_view, "b": b_view}
         self.scan_counts = {"a": 0, "b": 0}
 
@@ -117,10 +122,16 @@ class FakeSync:
     def copy_into_calendar(self, source, target_calendar, logical_key):
         raise AssertionError("copy should not run in this scenario")
 
+    def delete_choice_for(self, logical_key):
+        return syncmod.OutlookSync.delete_choice_for(self, logical_key)
+
+    def is_local_only_delete_choice(self, logical_key, side):
+        return syncmod.OutlookSync.is_local_only_delete_choice(self, logical_key, side)
+
 
 class DeleteTrackingSync(FakeSync):
-    def __init__(self, a_view, b_view, rows):
-        super().__init__(a_view, b_view, rows)
+    def __init__(self, a_view, b_view, rows, delete_choices=None):
+        super().__init__(a_view, b_view, rows, delete_choices=delete_choices)
         self.deleted_items = []
         self.copied_keys = []
 
@@ -212,6 +223,33 @@ class ResponsivenessTests(unittest.TestCase):
 
         self.assertEqual(fake.store.deletes, [key])
         self.assertEqual(fake.deleted_items, [a_item])
+        self.assertEqual(fake.copied_keys, [])
+
+    def test_local_only_delete_choice_keeps_counterpart(self):
+        key = "single|local-only-delete"
+        b_item = CountingBodyItem(datetime(2026, 1, 2, 3, 4, 5))
+        row = (
+            key,
+            "a-entry",
+            "a-store",
+            "b-entry",
+            "b-store",
+            "a-sig",
+            "b-sig",
+            "2026-01-02T03:04:05",
+            "2026-01-02T03:04:05",
+        )
+        fake = DeleteTrackingSync(
+            {},
+            {key: b_item},
+            [row],
+            delete_choices={key: {"side": "a", "scope": "local"}},
+        )
+
+        syncmod.OutlookSync.reconcile(fake)
+
+        self.assertEqual(fake.store.deletes, [key])
+        self.assertEqual(fake.deleted_items, [])
         self.assertEqual(fake.copied_keys, [])
 
 

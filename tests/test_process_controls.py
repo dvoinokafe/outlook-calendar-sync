@@ -308,6 +308,63 @@ class ProcessControlTests(unittest.TestCase):
         self.assertEqual(fake.reconcile_calls, 0)
         self.assertIn("stopped", stdout.getvalue().lower())
 
+    def test_run_attaches_delete_prompt_handlers_while_running(self):
+        class FakeSync:
+            settings = SimpleNamespace(POLL_SECONDS=5)
+
+            def __init__(self):
+                self.attach_calls = 0
+                self.reconcile_calls = 0
+
+            def attach_delete_prompt_handlers(self):
+                self.attach_calls += 1
+
+            def reconcile(self):
+                self.reconcile_calls += 1
+
+            def pump_com_messages(self):
+                return None
+
+        fake = FakeSync()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stop_path = Path(tmp) / "stop.request"
+            stdout = io.StringIO()
+
+            with (
+                mock.patch.object(syncmod, "STOP_REQUEST_PATH", stop_path),
+                mock.patch.object(syncmod, "acquire_control_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(syncmod, "wait_for_stop_or_timeout", return_value=True),
+                contextlib.redirect_stdout(stdout),
+            ):
+                syncmod.OutlookSync.run(fake)
+
+        self.assertEqual(fake.attach_calls, 1)
+        self.assertEqual(fake.reconcile_calls, 1)
+
+    def test_wait_for_stop_or_timeout_runs_tick_callback_while_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stop_path = Path(tmp) / "stop.request"
+            clock = SimpleNamespace(now=0.0)
+            ticks = []
+
+            def monotonic():
+                return clock.now
+
+            def sleep(seconds):
+                clock.now += seconds
+
+            result = syncmod.wait_for_stop_or_timeout(
+                0.5,
+                stop_path=stop_path,
+                sleep_func=sleep,
+                monotonic_func=monotonic,
+                tick_func=lambda: ticks.append(clock.now),
+            )
+
+        self.assertFalse(result)
+        self.assertGreater(len(ticks), 0)
+
     def test_wait_for_outlook_ready_records_waiting_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             status_path = Path(tmp) / "status.json"
@@ -494,23 +551,55 @@ class ProcessControlTests(unittest.TestCase):
         self.assertIn("--restart", text)
         self.assertIn("--settings", text)
 
+    def test_macro_ships_without_local_sync_script_path(self):
+        text = MACRO_FILE.read_text(encoding="utf-8")
+
+        self.assertIn('Private Const SYNC_SCRIPT As String = ""', text)
+        self.assertNotIn("C:\\Users\\", text)
+        self.assertNotIn("Documents\\Codex", text)
+        self.assertNotIn("\\outputs\\outlook_calendar_sync.py", text)
+
+    def test_macro_sanitizes_configured_paths_before_command(self):
+        text = MACRO_FILE.read_text(encoding="utf-8")
+
+        self.assertIn("CleanConfiguredPath", text)
+        self.assertIn("RequiredConfiguredPath(SYNC_SCRIPT", text)
+        self.assertIn("OptionalConfiguredPath(SETTINGS_FILE", text)
+        self.assertIn("Set SYNC_SCRIPT", text)
+        self.assertIn("contains an invalid quote", text)
+
     def test_macro_captures_command_output_without_visible_console(self):
         text = MACRO_FILE.read_text(encoding="utf-8")
 
         self.assertNotIn("shell.Exec", text)
-        self.assertIn("shell.Run command, 0, True", text)
+        self.assertIn("shell.Run Quote(commandPath), 0, True", text)
         self.assertIn(" 2>&1", text)
         self.assertIn("GetTempName", text)
         self.assertIn("DeleteFile outputPath, True", text)
+        self.assertIn("DeleteFile commandPath, True", text)
 
-    def test_macro_uses_real_python_executable_instead_of_python_launcher(self):
+    def test_macro_uses_temp_cmd_wrapper_for_paths_with_spaces(self):
         text = MACRO_FILE.read_text(encoding="utf-8")
 
+        self.assertIn("commandPath = outputPath & \".cmd\"", text)
+        self.assertIn("Set commandFile = fso.CreateTextFile(commandPath, True, False)", text)
+        self.assertIn("commandFile.WriteLine \"@echo off\"", text)
         self.assertIn(
-            'Private Const PYTHON_COMMAND As String = "%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe"',
+            'commandFile.WriteLine SyncCommand(action) & " > " & Quote(outputPath) & " 2>&1"',
             text,
         )
-        self.assertIn("Quote(ExpandEnv(PYTHON_COMMAND))", text)
+        self.assertNotIn(" /d /s /c ", text)
+
+    def test_macro_accepts_python_launcher_command_or_executable_path(self):
+        text = MACRO_FILE.read_text(encoding="utf-8")
+
+        self.assertIn('Private Const PYTHON_COMMAND As String = ""', text)
+        self.assertIn('Private Const DEFAULT_PYTHON_COMMAND As String = "py -3"', text)
+        self.assertIn("PythonCommandPrefix(PYTHON_COMMAND)", text)
+        self.assertIn("IsPyLauncherCommand", text)
+        self.assertIn("IsAllowedPyLauncherArgument", text)
+        self.assertNotIn("Python312\\python.exe", text)
+        self.assertNotIn('Quote(RequiredConfiguredPath(PYTHON_COMMAND', text)
 
 
 if __name__ == "__main__":

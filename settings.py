@@ -7,6 +7,8 @@ Keep it next to outlook_calendar_sync.py.
 
 # Use distinctive text from each Classic Outlook store/mailbox display name.
 # The email address is usually the easiest value to match.
+# Email addresses also help skip duplicate copies of invitations sent
+# between these two accounts.
 STORE_A_HINT = "me@company-a.com"
 STORE_B_HINT = "me@company-b.com"
 
