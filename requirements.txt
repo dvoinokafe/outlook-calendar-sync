@@ -1,1 +1,2 @@
+# Provides pythoncom and win32com.client for Classic Outlook COM automation.
 pywin32>=306
